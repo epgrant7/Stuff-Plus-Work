@@ -1,0 +1,291 @@
+---
+title: "Modeling with XGBoost"
+author: "Elias Grant 306445678"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries and Data
+```{r}
+library(tidyverse)
+library(xgboost)
+library(caret)
+data <- read_rds("stuff_data.rds")
+```
+
+# Feature Engineering
+
+### Adjust release location, approach angle, and horizontal break to account for pitcher handedness
+```{r}
+# Horizontal release location
+data <- data |>
+  mutate(RelSide2 = ifelse(PitcherThrows == "Left", -1 * RelSide, RelSide))
+
+# Horizontal break
+data <- data |>
+  mutate(HorzBreak2 = ifelse(PitcherThrows == "Left", -1 * HorzBreak, HorzBreak))
+
+# Spin induced horizontal break
+data <- data |>
+  mutate(pfxx2 = ifelse(PitcherThrows == "Left", -1 * pfxx, pfxx))
+
+# Horizontal approach angle
+data <- data |>
+  mutate(HorzApprAngle2 = ifelse(PitcherThrows == "Left", -1 * HorzApprAngle, HorzApprAngle))
+```
+
+### Create adjusted velocity and movement metrics relative to fastball
+```{r}
+# Velocity Differential
+fb_velo <- data |>
+  group_by(Pitcher) |>
+  filter(TaggedPitchType == "Fastball" | TaggedPitchType == "FourSeamFastBall") |>
+  summarize(avg_fbvelo = mean(RelSpeed, na.rm = TRUE))
+
+data <- data |>
+  left_join(fb_velo, by = "Pitcher")
+
+data <- data |>
+  mutate(speed_diff = RelSpeed - avg_fbvelo)
+
+# Movement Differential
+fb_break <- data |>
+  group_by(Pitcher) |>
+  filter(TaggedPitchType == "Fastball" | TaggedPitchType == "FourSeamFastBall") |>
+  summarize(avg_fbbreak = mean(pfxx2, na.rm = TRUE))
+
+data <- data |>
+  left_join(fb_break, by = "Pitcher")
+
+data <- data |>
+  mutate(break_diff = pfxx2 - avg_fbbreak)
+
+# Remove excess tibbles
+rm(fb_break, fb_velo)
+
+
+# Export dataset 
+saveRDS(object = data, file = "stuffplus_data.rds")
+```
+
+
+# Modeling XGBoost
+```{r}
+# Data Preparation
+data <- data |>
+  select(c("Pitcher", "TaggedPitchType", "RelSpeed", "SpinRate", "RelHeight", 
+           "RelSide2", "Extension", "InducedVertBreak", "pfxx2", "VertApprAngle", 
+           "HorzApprAngle2", "speed_diff", "break_diff", "linear_weight", "lw_event")) |>
+  drop_na()
+
+# Convert lw_event to a 0-indexed numeric factor required for XGBoost multi-class
+data$lw_event <- as.factor(data$lw_event)
+data$class_label <- as.numeric(data$lw_event) - 1
+num_classes <- length(unique(data$class_label))
+
+set.seed(10293939)
+train_index <- createDataPartition(data$linear_weight, p = 0.8, list = FALSE)
+
+train_df <- data[train_index,]
+test_df <- data[-train_index,]
+
+feature_cols <- c("RelSpeed", "SpinRate", "RelHeight", "RelSide2", "Extension", 
+                  "InducedVertBreak", "pfxx2", "VertApprAngle", "HorzApprAngle2", 
+                  "speed_diff", "break_diff")
+
+features1 <- as.matrix(train_df[, feature_cols])
+features2 <- as.matrix(test_df[, feature_cols])
+
+
+# REGRESSION MODEL
+label1_reg <- train_df$linear_weight
+label2_reg <- test_df$linear_weight
+
+train_reg <- xgb.DMatrix(data = features1, label = label1_reg)
+test_reg  <- xgb.DMatrix(data = features2, label = label2_reg)
+
+tune_grid <- expand.grid(
+  eta = c(0.01, 0.05, 0.1),
+  max_depth = c(3, 5, 7),
+  subsample = c(0.8, 1.0),
+  colsample_bytree = c(0.8, 1.0)
+)
+
+best_rmse <- Inf
+best_params_reg <- list()
+
+cat("Starting Grid Search for Regression Model...\n")
+
+for (i in 1:nrow(tune_grid)) {
+  params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = tune_grid$eta[i],
+    max_depth = tune_grid$max_depth[i],
+    subsample = tune_grid$subsample[i],
+    colsample_bytree = tune_grid$colsample_bytree[i]
+  )
+  
+  set.seed(10293939)
+  
+  mdl <- xgb.train(
+    params = params,
+    data = train_reg,
+    nrounds = 200, 
+    evals = list(val = test_reg), 
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  # Manually calculate RMSE
+  preds <- predict(mdl, test_reg)
+  current_rmse <- sqrt(mean((preds - label2_reg)^2))
+  
+  if (current_rmse < best_rmse) {
+    best_rmse <- current_rmse
+    best_params_reg <- params
+  }
+}
+
+cat("Best Regression RMSE:", best_rmse, "\n")
+print(best_params_reg)
+
+# Train Final Regression Model
+model_reg_final <- xgb.train(
+  params = best_params_reg,
+  data = train_reg,
+  nrounds = 500,
+  evals = list(train = train_reg, test = test_reg), 
+  early_stopping_rounds = 10,
+  print_every_n = 50
+)
+
+# CLASSIFICATION MODEL
+
+# Create DMatrix objects for classification
+label1_class <- train_df$class_label
+label2_class <- test_df$class_label
+
+train_class <- xgb.DMatrix(data = features1, label = label1_class)
+test_class  <- xgb.DMatrix(data = features2, label = label2_class)
+
+# Reformat linear weights to a vector, 
+# Ensure run-value is constant for each classification
+class_run_values <- train_df |>
+  group_by(class_label) |>
+  summarize(avg_rv = mean(linear_weight, na.rm = TRUE)) |>
+  arrange(class_label) |>
+  pull(avg_rv)
+
+params_class <- list(
+  objective = "multi:softprob",
+  eval_metric = "mlogloss",
+  num_class = num_classes,
+  eta = 0.05,
+  max_depth = 5
+)
+
+# Train Classification Model
+model_class <- xgb.train(
+  params = params_class,
+  data = train_class,
+  nrounds = 1000,
+  evals = list(train = train_class, test = test_class), 
+  early_stopping_rounds = 10,
+  print_every_n = 50
+)
+
+# Predictions and Evaluation
+
+# Predict probabilities on test set
+pred_probs <- predict(model_class, test_class)
+
+# Calculate Expected Run Value (xRV) via matrix multiplication
+test_df$predicted_xRV <- as.vector(pred_probs %*% class_run_values)
+
+# Compare regression predictions vs classification xRV predictions
+test_df$predicted_reg <- predict(model_reg_final, test_reg)
+
+# View results
+head(test_df[, c("linear_weight", "predicted_reg", "predicted_xRV")])
+```
+
+### Feature Importance 
+```{r}
+# Generate the importance matrices mapping your feature columns to the models
+importance_reg <- xgb.importance(feature_names = feature_cols, model = model_reg_final)
+importance_class <- xgb.importance(feature_names = feature_cols, model = model_class)
+
+# Print the dataframes to the console
+cat("\nTop Features: Regression Model\n")
+print(head(importance_reg, 5))
+
+cat("\nTop Features: Classification Model\n")
+print(head(importance_class, 5))
+
+# Plot the feature importance for visual comparison
+xgb.plot.importance(
+  importance_matrix = importance_reg, 
+  top_n = 10, 
+  measure = "Gain",
+  main = "Regression Predictor Importance"
+)
+
+xgb.plot.importance(
+  importance_matrix = importance_class, 
+  top_n = 10, 
+  measure = "Gain",
+  main = "Classification Predictor Importance"
+)
+```
+
+### Stuff+ Normalization
+```{r}
+# Calculate Stuff+ and group by pitcher
+
+# Calculate league averages and standard deviations from the test set
+mean_xRV <- mean(test_df$predicted_xRV, na.rm = TRUE)
+sd_xRV <- sd(test_df$predicted_xRV, na.rm = TRUE)
+
+mean_reg <- mean(test_df$predicted_reg, na.rm = TRUE)
+sd_reg <- sd(test_df$predicted_reg, na.rm = TRUE)
+
+# Score every individual pitch on the 100 scale
+# Formula: 100 - (Z-score * 10). 
+# Note: subtract the z-score because a lower run value denotes better pitcher performance.
+test_df <- test_df |>
+  mutate(
+    pitch_StuffPlus_xRV = 100 - ((predicted_xRV - mean_xRV) / sd_xRV) * 10,
+    pitch_StuffPlus_Reg = 100 - ((predicted_reg - mean_reg) / sd_reg) * 10
+  )
+
+# Group by Pitcher and summarize
+pitcher_leaderboard <- test_df |>
+  group_by(Pitcher) |>
+  summarize(
+    Pitches = n(),
+    # Calculate the average Stuff+ score for the pitcher
+    StuffPlus_xRV = round(mean(pitch_StuffPlus_xRV, na.rm = TRUE), 1),
+    StuffPlus_Reg = round(mean(pitch_StuffPlus_Reg, na.rm = TRUE), 1)
+  ) |>
+  # Filter out low-sample pitchers
+  filter(Pitches >= 20) |> 
+  # Sort by the Classification xRV model's Stuff+ descending
+  arrange(desc(StuffPlus_xRV))
+
+# View the top 10 pitchers by Stuff+
+cat("\n--- Top 10 Pitchers by Stuff+ (xRV Model) ---\n")
+print(head(pitcher_leaderboard, 10))
+
+# View the bottom 10 pitchers by Stuff+
+cat("\n--- Bottom 10 Pitchers by Stuff+ (xRV Model) ---\n")
+print(tail(pitcher_leaderboard, 10))
+```
+
+Overall, after cross-checking with Baseball Reference for the actual results of the top and bottom 10 pitchers, initial results are promising. Higher sample size is a must-have, but the work so far is a solid foundation to build on

@@ -1,0 +1,158 @@
+---
+title: "Stuff Plus Run Value Calculations"
+author: "Elias Grant 306445678"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Data
+```{r}
+library(tidyverse)
+library(lubridate)
+
+# Read in and clean the UCLA data
+
+ucla2024 <- read_csv("2024UCLACleanData.csv", show_col_types = FALSE)
+
+ucla2024 <- ucla2024 |>
+  rename(Top.Bottom = `Top/Bottom`)
+
+ucla2024$Date <- mdy(ucla2024$Date)
+
+ucla2023 <- read_csv("2023UCLACleanData.csv", show_col_types = FALSE)
+
+ucla2023$Date <- mdy(ucla2023$Date)
+
+# Read in the data from the other Big 10 Schools
+
+michigan <- read_csv("Michigan2024.csv", show_col_types = FALSE)
+
+pennstate <- read_csv("PennState2024.csv", show_col_types = FALSE)
+
+purdue <- read_csv("Purdue2024.csv", show_col_types = FALSE)
+
+# Combine all into a single tibble
+
+data <- bind_rows(ucla2024, ucla2023)
+
+data$UTCDate <- mdy(data$UTCDate)
+data$AwayTeamForeignID <- as.character(data$AwayTeamForeignID)
+
+data2 <- bind_rows(michigan, pennstate, purdue)
+
+data <- bind_rows(data, data2)
+
+data <- data |>
+  filter(!(PitchCall == "Undefined" | PitchCall == "BallIntentional"))
+
+# Remove extraneous tibbles
+rm(michigan, purdue, pennstate, ucla2023, ucla2024, data2)
+
+```
+
+
+# Create Linear Weights
+```{r}
+library(baseballr)
+
+# Pull all pitch data from the 2019 Season, broken into chunks to load in one at a time.
+# May take a while to load fully
+dates <- list(ymd("2019-03-20"))
+
+for (i in 2:33) {
+  dates[[i]] <- dates[[i - 1]] + 7
+}
+
+statcast <- map2(
+  .x = dates[-length(dates)],
+  .y = dates[-1],
+  ~ statcast_search(
+      start_date = as.character(.x + ifelse(.x == dates[1], 0, 1)),
+      end_date   = as.character(.y)
+    )
+) |>
+  bind_rows()
+
+
+# Clean Data
+statcast <- statcast |>
+  filter(!(description == "automatic_ball" | description == "automatic_strike")) |>
+  filter(!(description == "hit_into_play" & is.na(launch_speed))) |>
+  filter(!(description == "pitchout"))
+
+statcast$description <- str_replace(statcast$description, ".*foul.*", "foul")
+statcast$description <- str_replace(statcast$description, "(blocked_ball|hit_by_pitch)", "ball")
+statcast$description <- str_replace(statcast$description, "(missed_bunt|swinging_strike.*)", "swinging_strike")
+
+
+# Add Counts
+statcast <- statcast |>
+  mutate(
+    count = str_c(balls, "-", strikes)
+  )
+
+data <- data |>
+  mutate(
+    count = str_c(Balls, "-", Strikes)
+  )
+
+# Add appropriate event labels to both data sets
+statcast <- statcast |>
+  mutate(
+    lw_event = case_when(
+      description == "ball" ~ "ball",
+      description == "called_strike" ~ "called_strike",
+      description == "swinging_strike" ~ "swinging_strike",
+      description == "foul" ~ "foul",
+      description == "hit_into_play" & launch_speed < 85 ~ "hit_85",
+      description == "hit_into_play" & launch_speed < 95 ~ "hit85_95",
+      description == "hit_into_play" & launch_speed < 100 ~ "hit95_100",
+      description == "hit_into_play" & launch_speed < 105 ~ "hit100_105",
+      description == "hit_into_play" & launch_speed >= 105 ~ "hit105_",
+      TRUE ~ NA_character_
+    )
+  )
+
+data <- data |>
+  mutate(
+    lw_event = case_when(
+      PitchCall == "BallCalled" ~ "ball",
+      PitchCall == "BallinDirt" ~ "ball",
+      PitchCall == "HitByPitch" ~ "ball",
+      PitchCall == "StrikeCalled" ~ "called_strike",
+      PitchCall == "StrikeSwinging" ~ "swinging_strike",
+      str_detect(PitchCall, "Foul") ~ "foul",
+      PitchCall == "InPlay" & ExitSpeed < 85 ~ "hit_85",
+      PitchCall == "InPlay" & ExitSpeed < 95 ~ "hit85_95",
+      PitchCall == "InPlay" & ExitSpeed < 100 ~ "hit95_100",
+      PitchCall == "InPlay" & ExitSpeed < 105 ~ "hit100_105",
+      PitchCall == "InPlay" & ExitSpeed >= 105 ~ "hit105_",
+      TRUE ~ NA_character_
+    )
+  )
+
+# Filter to Avg Run Value by Outcome and Count
+
+linear_weights <- statcast |>
+  group_by(lw_event, count) |>
+  filter(!is.na(delta_run_exp)) |>
+  summarize(linear_weight = mean(delta_run_exp))
+
+# Join linear weight to each pitch.
+data <- data |>
+  left_join(linear_weights, by = c("lw_event", "count"))
+
+# Save statcast dataframe
+saveRDS(object = statcast, file = "statcast.rds")
+
+# Save data dataframe
+saveRDS(object = data, file = "stuff_data.rds")
+
+```
+
+
+
